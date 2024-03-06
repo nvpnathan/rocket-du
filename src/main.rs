@@ -1,56 +1,117 @@
-pub mod auth;
-pub mod digitize;
-mod paste_id;
+use rocket::data::ByteUnit;
+use rocket::http::Status;
+use rocket::response::Response;
+use rocket::tokio::fs::File;
+use rocket::{
+    data::Data,
+    error,
+    launch, post, routes,
+    serde::{Deserialize, Serialize},
+};
+use std::env;
+use std::io::BufWriter;
+use std::path::PathBuf;
+use rocket::serde::json::json;
 
-use std::io;
-#[macro_use] extern crate rocket;
-use rocket::data::{Data, ToByteUnit};
-use rocket::http::uri::Absolute;
-use rocket::response::content::RawText;
-use rocket::tokio::fs::{self, File};
-use paste_id::PasteId;
-
-const HOST: Absolute<'static> = uri!("http://localhost:8000");
-const ID_LENGTH: usize = 3;
-#[post("/", data = "<paste>")]
-async fn upload(paste: Data<'_>) -> io::Result<String> {
-    let id = PasteId::new(ID_LENGTH);
-    paste.open(128.kibibytes()).into_file(id.file_path()).await?;
-    Ok(uri!(HOST, retrieve(id)).to_string())
+// Load environment variables
+fn load_env_vars() -> (String, String, String, String, String) {
+    (
+        env::var("APP_ID").unwrap(),
+        env::var("APP_SECRET").unwrap(),
+        env::var("AUTH_URL").unwrap(),
+        env::var("BASE_URL").unwrap(),
+        env::var("PROJECT_ID").unwrap(),
+    )
 }
 
-
-#[get("/<id>")]
-async fn retrieve(id: PasteId<'_>) -> Option<RawText<File>> {
-    File::open(id.file_path()).await.map(RawText).ok()
+// Trait to define functionality for different client services (Digitize, Classify, etc.)
+trait Client {
+    fn digitize(&self, document_path: &str) -> Option<String>;
+    fn classify_document(&self, document_id: &str, classification_type: &str) -> Option<String>;
 }
 
+// Mock implementations for clients (replace with actual implementations)
+struct MockDigitize;
 
-#[delete("/<id>")]
-async fn delete(id: PasteId<'_>) -> Option<()> {
-    fs::remove_file(id.file_path()).await.ok()
+impl Client for MockDigitize {
+    fn digitize(&self, _document_path: &str) -> Option<String> {
+        Some("mock_document_id".to_string())
+    }
+
+    fn classify_document(&self, _document_id: &str, _classification_type: &str) -> Option<String> {
+        Some("mock_document_type_id".to_string())
+    }
 }
 
+// Struct to represent the API response
+#[derive(Debug, Serialize, Deserialize)]
+struct ApiResponse {
+    result: Option<String>,
+    error: Option<String>,
+}
 
-#[get("/")]
-fn index() -> &'static str {
-    "
-    USAGE
+// Function to process the uploaded document
+async fn process_document(document_path: &str, client: &impl Client) -> Option<String> {
+    let document_id = client.digitize(document_path)?;
+    if document_id.is_empty() {
+        return None;
+    }
 
-      POST /
+    let document_type_id = client.classify_document(&document_id, "ml-classification")?;
+    if document_type_id.is_empty() {
+        return None;
+    }
 
-          accepts raw data in the body of the request and responds with a URL of
-          a page containing the body's content
+    Some(format!(
+        "Extracted data for document type: {}",
+        document_type_id
+    ))
+}
 
-          EXAMPLE: curl --data-binary @file.png http://localhost:8000
+// Function to handle file upload
+#[post("/upload", data = "<file>")]
+async fn upload(file: Data<'_>) -> Result<Status, Status> {
+    let mut filename = PathBuf::from("uploaded_file");
 
-      GET /<id>
+    // Open a file for writing
+    let uploaded_file = File::create(&filename).await.map_err(|err| {
+        error!("Error creating file: {}", err);
+        Status::InternalServerError
+    })?;
 
-          retrieves the content for the paste with id `<id>`
-    "
+    // Create a buffer for efficient writing
+    let mut writer = BufWriter::new(uploaded_file);
+
+    // Read from the Data stream and write it to the file
+    file.stream_to(&mut writer, ByteUnit::max_value())
+        .await
+        .map_err(|err| {
+            error!("Error writing to file: {}", err);
+            Status::InternalServerError
+        })?;
+
+    // Process the uploaded file
+    let result = process_document(filename.to_str().unwrap(), &(MockDigitize)).await;
+
+    // Remove the temporary file
+    if let Err(err) = std::fs::remove_file(&filename) {
+        error!("Error removing temporary file: {}", err);
+    }
+
+    // Return the response based on the processing result
+    let response = if let Some(extracted_data) = result {
+        json!({ "result": extracted_data })
+    } else {
+        json!({ "error": "Document processing failed" })
+    };
+
+    Ok(Response::build()
+           .status(if result.is_some() { Status::Ok } else { Status::InternalServerError })
+        .status(Default::default())
+    )
 }
 
 #[launch]
 fn rocket() -> _ {
-    rocket::build().mount("/", routes![index, upload, retrieve, delete])
+    rocket::build().mount("/", routes![upload])
 }
